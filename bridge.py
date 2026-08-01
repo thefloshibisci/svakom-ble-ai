@@ -48,6 +48,12 @@ def cmd_scale_stop():
 def cmd_vibrate(mode, level):
     return bytes([H, 3, 0, 0, max(1, min(8, mode)), max(1, min(5, level)), 0])
 
+def cmd_thrust(mode, strength):
+    return bytes([H, 8, 0, 0, max(1, min(7, mode)), max(1, min(10, strength)), 0])
+
+def cmd_suck(mode, strength):
+    return bytes([H, 9, 0, 0, max(1, min(5, mode)), max(1, min(10, strength)), 0])
+
 def cmd_heat_on():
     return bytes([H, 5, 1, 0x37, 0, 0, 0])
 
@@ -107,6 +113,30 @@ async def exec_cmd(c: dict):
         current_until = parse_duration(c)
         await write(current_cmd)
         log(f"🌀 花样 {mode} 档 {level}")
+        return
+
+    # Specific commands (0x03, 0x08, 0x09)
+    if "cmd_type" in c:
+        ct = c["cmd_type"]
+        if ct == "vibrate":
+            mode = int(c.get("mode", 1))
+            level = int(c.get("level", 3))
+            current_cmd = cmd_vibrate(mode, level)
+            current_until = parse_duration(c)
+            await write(current_cmd)
+            log(f"🌀 振动花样 mode={mode} level={level}")
+        elif ct == "thrust":
+            mode = int(c.get("mode", 1))
+            strength = int(c.get("strength", 5))
+            buf = cmd_thrust(mode, strength)
+            await write(buf)
+            log(f"💨 伸缩 mode={mode} strength={strength}")
+        elif ct == "suck":
+            mode = int(c.get("mode", 1))
+            strength = int(c.get("strength", 5))
+            buf = cmd_suck(mode, strength)
+            await write(buf)
+            log(f"🌀 吸吠 mode={mode} strength={strength}")
         return
 
     # Speed/intensity (CMD_SCALE)

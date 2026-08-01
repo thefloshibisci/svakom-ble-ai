@@ -127,6 +127,39 @@ app.post('/mcp', checkSecret, (req, res) => {
             inputSchema: { type: 'object', properties: {} }
           },
           {
+            name: 'vibrate_pattern',
+            description: 'Set vibration pattern (CMD_VIBRATE 0x03). Only affects vibration motor, not suction/thrust. mode: 1-8, level: 1-5.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                mode: { type: 'integer', default: 1, description: 'Pattern 1-8' },
+                level: { type: 'integer', default: 3, description: 'Level 1-5' }
+              }
+            }
+          },
+          {
+            name: 'thrust_cmd',
+            description: 'Send thrust command (CMD 0x08). mode: 1-7, strength: 1-10.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                mode: { type: 'integer', default: 1 },
+                strength: { type: 'integer', default: 5 }
+              }
+            }
+          },
+          {
+            name: 'suck_cmd',
+            description: 'Send suction command (CMD 0x09). mode: 1-5, strength: 1-10.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                mode: { type: 'integer', default: 1 },
+                strength: { type: 'integer', default: 5 }
+              }
+            }
+          },
+          {
             name: 'pattern',
             description: 'Execute a timed sequence of actions. Each step: {action, mode, strength, duration}.',
             inputSchema: {
@@ -201,6 +234,21 @@ app.post('/mcp', checkSecret, (req, res) => {
         commandQueue.push({ stop: true });
         resultText = `Pattern ${steps.length} steps -> queued`;
         cmd = null; // already pushed
+        break;
+      }
+      case 'vibrate_pattern': {
+        cmd = { cmd_type: 'vibrate', mode: args.mode || 1, level: args.level || 3 };
+        resultText = `Vibrate pattern mode=${args.mode || 1} level=${args.level || 3} -> queued`;
+        break;
+      }
+      case 'thrust_cmd': {
+        cmd = { cmd_type: 'thrust', mode: args.mode || 1, strength: args.strength || 5 };
+        resultText = `Thrust cmd mode=${args.mode || 1} strength=${args.strength || 5} -> queued`;
+        break;
+      }
+      case 'suck_cmd': {
+        cmd = { cmd_type: 'suck', mode: args.mode || 1, strength: args.strength || 5 };
+        resultText = `Suck cmd mode=${args.mode || 1} strength=${args.strength || 5} -> queued`;
         break;
       }
       case 'status': {
