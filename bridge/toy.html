@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#17131a">
+  <title>南枳 · 手机蓝牙桥</title>
+  <style>
+    :root { color-scheme: dark; --bg:#17131a; --card:#241d29; --line:#47384f; --text:#f7eef8; --muted:#bcaec2; --accent:#e3a9cc; --ok:#8bd6a5; --bad:#ff8f9b; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:radial-gradient(circle at top,#34233a 0,#17131a 46%); color:var(--text); font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { width:min(680px,100%); margin:auto; padding:24px 18px 48px; }
+    h1 { margin:0 0 4px; font-size:28px; }
+    .sub { color:var(--muted); margin:0 0 20px; }
+    .card { background:rgba(36,29,41,.94); border:1px solid var(--line); border-radius:18px; padding:18px; margin:14px 0; box-shadow:0 12px 40px #0005; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    label { display:block; color:var(--muted); margin-bottom:6px; font-size:14px; }
+    input { width:100%; border:1px solid var(--line); border-radius:12px; background:#17131a; color:var(--text); padding:12px; font:inherit; }
+    button { flex:1; min-width:130px; border:0; border-radius:12px; padding:13px 16px; font:700 16px/1 system-ui; cursor:pointer; background:var(--accent); color:#261526; }
+    button.secondary { background:#3a2e40; color:var(--text); border:1px solid var(--line); }
+    button.stop { background:var(--bad); color:#2d0e12; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .status { display:flex; gap:10px; align-items:center; font-weight:700; }
+    .dot { width:12px; height:12px; border-radius:50%; background:var(--bad); box-shadow:0 0 12px currentColor; }
+    .dot.ok { background:var(--ok); }
+    .facts { margin:12px 0 0; display:grid; grid-template-columns:1fr 1fr; gap:8px; color:var(--muted); font-size:14px; }
+    pre { margin:0; max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:#d8cadc; font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .warn { color:#f7c986; font-size:14px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>南枳 · 手机蓝牙桥</h1>
+  <p class="sub">手机 Chrome 轮询中继，并通过 Web Bluetooth 控制 FFE1。</p>
+
+  <section class="card">
+    <label for="secret">中继密钥（只保存在本机浏览器）</label>
+    <input id="secret" type="password" autocomplete="off" placeholder="BRIDGE_SECRET">
+    <div class="row" style="margin-top:12px">
+      <button id="saveSecret" class="secondary">保存密钥</button>
+      <button id="connect">连接玩具</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="status"><span id="dot" class="dot"></span><span id="status">尚未连接</span></div>
+    <div class="facts">
+      <span>设备：<b id="deviceName">—</b></span>
+      <span>轮询：<b id="pollState">未启动</b></span>
+      <span>当前指令：<b id="current">停止</b></span>
+      <span>屏幕锁：<b id="wakeState">未申请</b></span>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button id="localStop" class="stop">本地立即停止</button>
+      <button id="disconnect" class="secondary">断开蓝牙</button>
+    </div>
+    <p class="warn">保持此页面在前台并让屏幕常亮。切换 App 或锁屏后，Chrome 可能暂停蓝牙和轮询。</p>
+  </section>
+
+  <section class="card"><pre id="log">等待连接…</pre></section>
+</main>
+<script>
+(() => {
+  'use strict';
+
+  const SERVICE_UUID = '0000ffe0-0000-1000-8000-00805f9b34fb';
+  const WRITE_UUID = '0000ffe1-0000-1000-8000-00805f9b34fb';
+  const POLL_MS = 300;
+  const KEEPALIVE_MS = 1400;
+  const STOP_PACKET = new Uint8Array([0x55,0x04,0x00,0x00,0x00,0x00,0xAA]);
+  const INIT_PACKETS = [
+    [0x55,0x04,0x00,0x00,0x01,0xFF,0xAA],
+    [0x55,0x04,0x00,0x00,0x00,0x00,0xAA],
+    [0x55,0x04,0x00,0x00,0x00,0x00,0xAA],
+    [0x55,0x03,0x00,0x00,0x00,0x00,0x00]
+  ].map(x => new Uint8Array(x));
+
+  const $ = id => document.getElementById(id);
+  const secretInput = $('secret');
+  secretInput.value = localStorage.getItem('toyBridgeSecret') || '';
+
+  let device = null;
+  let writeChar = null;
+  let currentPacket = null;
+  let currentUntil = 0;
+  let pollTimer = null;
+  let keepaliveTimer = null;
+  let wakeLock = null;
+  let writing = Promise.resolve();
+
+  function log(message) {
+    const time = new Date().toLocaleTimeString();
+    $('log').textContent = `[${time}] ${message}\n` + $('log').textContent.slice(0, 5000);
+  }
+
+  function setConnected(ok, text) {
+    $('dot').classList.toggle('ok', ok);
+    $('status').textContent = text;
+    $('deviceName').textContent = device?.name || '—';
+  }
+
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  async function requestWakeLock() {
+    if (!('wakeLock' in navigator)) {
+      $('wakeState').textContent = '不支持';
+      return;
+    }
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      $('wakeState').textContent = '已保持常亮';
+      wakeLock.addEventListener('release', () => $('wakeState').textContent = '已释放');
+    } catch (e) {
+      $('wakeState').textContent = '申请失败';
+      log(`Wake Lock 失败：${e.message}`);
+    }
+  }
+
+  async function rawWrite(packet) {
+    if (!writeChar || !device?.gatt?.connected) throw new Error('蓝牙未连接');
+    if (writeChar.properties.writeWithoutResponse && writeChar.writeValueWithoutResponse) {
+      await writeChar.writeValueWithoutResponse(packet);
+    } else {
+      await writeChar.writeValue(packet);
+    }
+  }
+
+  function queueWrite(packet) {
+    writing = writing.then(() => rawWrite(packet)).catch(e => {
+      log(`写入失败：${e.message}`);
+      setConnected(false, '写入失败 / 已断开');
+    });
+    return writing;
+  }
+
+  function scalePacket(value) {
+    const v = Math.max(0, Math.min(255, Math.round(value)));
+    return new Uint8Array([0x55,0x04,0x00,0x00,0x01,v,0xAA]);
+  }
+
+  function vibratePacket(mode, level) {
+    return new Uint8Array([0x55,0x03,0x00,0x00,
+      Math.max(1,Math.min(8,Number(mode)||1)),
+      Math.max(1,Math.min(5,Number(level)||3)),0x00]);
+  }
+
+  function commandPacket(command) {
+    if (command.cmd_type === 'vibrate' || 'pattern' in command) {
+      return vibratePacket(command.mode ?? command.pattern, command.level ?? 3);
+    }
+    if (command.cmd_type === 'thrust') {
+      return new Uint8Array([0x55,0x08,0x00,0x00,
+        Math.max(1,Math.min(7,Number(command.mode)||1)),
+        Math.max(1,Math.min(10,Number(command.strength)||5)),0x00]);
+    }
+    if (command.cmd_type === 'suck') {
+      return new Uint8Array([0x55,0x09,0x00,0x00,
+        Math.max(1,Math.min(5,Number(command.mode)||1)),
+        Math.max(1,Math.min(10,Number(command.strength)||5)),0x00]);
+    }
+    const raw = command.speed ?? command.suck ?? command.intensity;
+    if (raw !== undefined && raw !== null) {
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n <= 0) return STOP_PACKET;
+      return scalePacket(n <= 1 ? n * 255 : n);
+    }
+    return null;
+  }
+
+  async function stopNow(reason='本地停止') {
+    currentPacket = null;
+    currentUntil = 0;
+    $('current').textContent = '停止';
+    if (!writeChar || !device?.gatt?.connected) return;
+    // 连发两次停止包，间隔很短；不续命、不等待远端队列。
+    await queueWrite(STOP_PACKET);
+    await sleep(80);
+    await queueWrite(STOP_PACKET);
+    log(`⏹ ${reason}`);
+  }
+
+  async function execute(command) {
+    if (!command || command.type === 'hello') return;
+    if (command.stop) {
+      await stopNow('收到远端停止');
+      return;
+    }
+    if ('heat' in command) {
+      const packet = command.heat
+        ? new Uint8Array([0x55,0x05,0x01,0x37,0,0,0])
+        : new Uint8Array([0x55,0x05,0,0,0,0,0]);
+      await queueWrite(packet);
+      log(command.heat ? '🔥 加热开' : '❄️ 加热关');
+      return;
+    }
+    const packet = commandPacket(command);
+    if (!packet) {
+      log(`忽略未知指令：${JSON.stringify(command)}`);
+      return;
+    }
+    currentPacket = packet === STOP_PACKET ? null : packet;
+    const seconds = Number(command.sec ?? command.seconds ?? command.duration ?? 0);
+    currentUntil = seconds > 0 ? Date.now() + seconds * 1000 : 0;
+    await queueWrite(packet);
+    $('current').textContent = currentPacket ? JSON.stringify(command) : '停止';
+    log(`📨 ${JSON.stringify(command)}`);
+  }
+
+  async function poll() {
+    if (!writeChar || !device?.gatt?.connected) return;
+    try {
+      const secret = secretInput.value.trim();
+      const headers = secret ? {'x-bridge-secret': secret} : {};
+      const response = await fetch('/toy-next', {headers, cache:'no-store'});
+      $('pollState').textContent = response.ok ? '在线' : `HTTP ${response.status}`;
+      if (response.status === 401) throw new Error('密钥不正确');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await execute(await response.json());
+    } catch (e) {
+      $('pollState').textContent = '异常';
+      log(`轮询失败：${e.message}`);
+    }
+  }
+
+  function startLoops() {
+    clearInterval(pollTimer);
+    clearInterval(keepaliveTimer);
+    pollTimer = setInterval(poll, POLL_MS);
+    keepaliveTimer = setInterval(async () => {
+      if (currentUntil && Date.now() >= currentUntil) {
+        await stopNow('定时结束');
+      } else if (currentPacket && writeChar && device?.gatt?.connected) {
+        await queueWrite(currentPacket);
+      }
+    }, KEEPALIVE_MS);
+    poll();
+  }
+
+  async function connect() {
+    if (!navigator.bluetooth) {
+      alert('当前浏览器不支持 Web Bluetooth。请使用 Android Chrome 或 Edge，并通过 HTTPS 打开。');
+      return;
+    }
+    try {
+      $('connect').disabled = true;
+      setConnected(false, '扫描中…');
+      await requestWakeLock();
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{namePrefix:'SL278'}],
+        optionalServices: [SERVICE_UUID]
+      });
+      device.addEventListener('gattserverdisconnected', () => {
+        currentPacket = null;
+        currentUntil = 0;
+        writeChar = null;
+        setConnected(false, '蓝牙已断开');
+        $('pollState').textContent = '已停止';
+        log('蓝牙断开；请点“连接玩具”重新连接。');
+      });
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      writeChar = await service.getCharacteristic(WRITE_UUID);
+
+      for (const packet of INIT_PACKETS) {
+        await rawWrite(packet);
+        await sleep(80);
+      }
+      await sleep(300);
+      await stopNow('初始化完成');
+      setConnected(true, '✅ 已就绪，等待指令');
+      log(`连接成功：${device.name || '未命名设备'}。仅使用 FFE0/FFE1。`);
+      startLoops();
+    } catch (e) {
+      setConnected(false, `连接失败：${e.message}`);
+      log(`连接失败：${e.message}`);
+    } finally {
+      $('connect').disabled = false;
+    }
+  }
+
+  $('saveSecret').addEventListener('click', () => {
+    localStorage.setItem('toyBridgeSecret', secretInput.value.trim());
+    log('密钥已保存在本机浏览器。');
+  });
+  $('connect').addEventListener('click', connect);
+  $('localStop').addEventListener('click', () => stopNow('点击本地停止'));
+  $('disconnect').addEventListener('click', async () => {
+    await stopNow('断开前停止');
+    device?.gatt?.disconnect();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && device?.gatt?.connected) requestWakeLock();
+  });
+  window.addEventListener('pagehide', () => {
+    currentPacket = null;
+    currentUntil = 0;
+    if (writeChar && device?.gatt?.connected) rawWrite(STOP_PACKET).catch(()=>{});
+  });
+})();
+</script>
+</body>
+</html>

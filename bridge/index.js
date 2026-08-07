@@ -5,12 +5,22 @@
  * 部署到 Zeabur/Railway，设置环境变量 BRIDGE_SECRET。
  */
 import express from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const app = express();
 app.use(express.json());
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.BRIDGE_SECRET || '';
+
+// --- 手机 Web Bluetooth 中继页面（同源访问 /toy-next，无需额外 CORS）---
+app.get(['/', '/toy', '/toy.html'], (_req, res) => {
+  res.sendFile(path.join(__dirname, 'toy.html'));
+});
 
 // --- 指令队列 ---
 let commandQueue = [];
@@ -49,7 +59,12 @@ app.post('/command', checkSecret, (req, res) => {
   if (!cmd || typeof cmd !== 'object') {
     return res.status(400).json({ error: 'invalid command' });
   }
-  commandQueue.push(cmd);
+  // 急停必须越过所有残留动作；普通指令限制队列长度，避免旧动作积压。
+  if (cmd.stop) commandQueue = [{ stop: true }];
+  else {
+    commandQueue.push(cmd);
+    if (commandQueue.length > 50) commandQueue = commandQueue.slice(-50);
+  }
   res.json({ ok: true, queued: cmd });
 });
 
@@ -221,8 +236,10 @@ app.post('/mcp', checkSecret, (req, res) => {
         break;
       }
       case 'stop': {
+        // 丢弃尚未执行的旧动作，让手机下一次轮询首先拿到急停。
+        commandQueue = [];
         cmd = { stop: true };
-        resultText = 'Stop -> queued';
+        resultText = 'Stop -> queued with priority';
         break;
       }
       case 'pattern': {
@@ -287,7 +304,8 @@ app.listen(PORT, () => {
   console.log(`Secret: ${SECRET ? '***' : '(none)'}`);
   console.log();
   console.log('Endpoints:');
-  console.log('  GET  /toy-next  - bridge.py polls this');
+  console.log('  GET  / or /toy - Android Chrome Web Bluetooth bridge');
+  console.log('  GET  /toy-next  - phone page / bridge.py polls this');
   console.log('  GET  /status    - check bridge status');
   console.log('  POST /command   - push a command');
   console.log('  POST /mcp       - MCP protocol (for AI clients)');
